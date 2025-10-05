@@ -1,7 +1,7 @@
 flask
 python-dotenv
 google-generativeai
-pinecone-client
+pinecone
 fastapi
 uvicorn
 
