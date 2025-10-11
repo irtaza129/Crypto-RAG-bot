@@ -1,5 +1,6 @@
 import re
 import os
+import json
 from dotenv import load_dotenv
 from pinecone import Pinecone
 import google.generativeai as genai
@@ -21,8 +22,7 @@ index = pc.Index(PINECONE_INDEX_NAME)
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
-
-# === Jurisdiction Detection ===
+# === Jurisdiction Mapping (static + fallback) ===
 JURISDICTION_MAP = {
     "FCA": "UK",
     "UK": "UK",
@@ -46,13 +46,50 @@ JURISDICTION_MAP = {
     "European Union": "EU",
 }
 
+
+# === Static Jurisdiction Detection (regex-based) ===
 def detect_jurisdictions(query):
-    """Detect all jurisdictions/countries from query using known keywords."""
+    """Detect jurisdictions from known keywords."""
     found = set()
     for keyword, country in JURISDICTION_MAP.items():
         if re.search(rf"\b{re.escape(keyword)}\b", query, re.IGNORECASE):
             found.add(country)
-    return list(found) if found else None
+    return list(found) if found else []
+
+
+# === LLM-based Relevance + Jurisdiction Detection ===
+def check_crypto_relevance_and_jurisdiction(query):
+    """
+    Use Gemini to determine if query is about crypto compliance and which jurisdictions are mentioned.
+    """
+    relevance_prompt = f"""
+You are a compliance classification model. Given the user query, determine:
+1. Whether it is about **cryptocurrency compliance, AML/KYC, exchange regulations, licensing, or FATF topics**.
+2. Extract relevant jurisdictions or countries mentioned (among: UK, USA, EU, Singapore, Japan, UAE, Canada, Australia, Hong Kong).
+
+Respond ONLY in strict JSON:
+{{
+  "is_compliance_related": true/false,
+  "jurisdictions": ["list", "of", "countries"]
+}}
+
+User query: "{query}"
+"""
+    try:
+        response = model.generate_content(relevance_prompt)
+        text = response.text.strip()
+        # Clean Gemini's markdown fences
+        text = re.sub(r"^```json|```$", "", text, flags=re.MULTILINE).strip()
+
+        parsed = json.loads(text)
+        is_related = parsed.get("is_compliance_related", False)
+        jurisdictions = parsed.get("jurisdictions", [])
+        return is_related, jurisdictions
+
+    except Exception as e:
+        logger.warning(f"⚠️ LLM response not JSON parsable: {e}")
+        # fallback to regex
+        return True, detect_jurisdictions(query)
 
 
 # === Query Enhancement ===
@@ -64,7 +101,8 @@ def enhance_query(query):
         compare_note = ""
 
     enhancement_prompt = f"""
-You are an expert in information retrieval and prompt engineering. Rewrite and expand the query for maximum recall and relevance.
+You are an expert in information retrieval and prompt engineering.
+Rewrite and expand this query for maximum recall and relevance in a crypto compliance context.
 {compare_note}
 
 Original query: "{query}"
@@ -116,14 +154,20 @@ def build_prompt(query, retrieved_docs):
     context = "\n\n".join(context_texts)
 
     prompt = f"""
-You are a highly knowledgeable crypto compliance assistant specializing in cryptocurrency regulations worldwide.
+You are a highly knowledgeable **Crypto Compliance Assistant** specializing in cryptocurrency regulations
+across 10 key jurisdictions: UK, USA, EU, Singapore, Japan, UAE, Canada, Australia, and Hong Kong.
+
+Use the provided context to generate a structured, accurate, and actionable answer.
 
 Context:
 {context}
 
-Question: {query}
+User Query: {query}
 
-Answer in a detailed, structured, and actionable way.
+Answer professionally with:
+- Headings where relevant
+- Bullet points or numbering for clarity
+- Use **bold** text for emphasis
 """
     return prompt, context_texts
 
@@ -133,13 +177,21 @@ def rag_answer(query):
     """Main RAG pipeline returning both answer and retrieved chunks."""
     logger.info(f"Running RAG pipeline for query: {query}")
 
+    # Step 1: Check compliance relevance first
+    is_related, jurisdictions = check_crypto_relevance_and_jurisdiction(query)
+
+    if not is_related:
+        logger.info("❌ Query not crypto compliance–related. Skipping response.")
+        return "This assistant only answers queries related to **crypto compliance and regulatory frameworks**. Ask me anything related to Crypto Compliances Related to specific jurisdictions.", []
+
+    # Step 2: Retrieve and build prompt
     results = retrieve_context(query)
     prompt, context_chunks = build_prompt(query, results)
 
+    # Step 3: Generate final answer
     response = model.generate_content(prompt)
     answer = response.text.strip()
 
-    # Return both answer + retrieved chunks
     return answer, context_chunks
 
 
