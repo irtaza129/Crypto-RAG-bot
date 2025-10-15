@@ -5,11 +5,7 @@ from pinecone import Pinecone
 import google.generativeai as genai
 from utils.logger import logger
 
-# ====== CONFIG ======
-GEMINI_API_KEY = "AIzaSyAfEChz8G2jTJBt-zIzYr_6dnHv8qj_TEQ"
-PINECONE_API_KEY = "pcsk_6nMJvn_UNp6BCbBMtMFSmZd1oZNrYdSzJEgdFVnhHWKay9zepAUGXTd87rscERAtxZaAAB"
-INDEX_NAME = "rag-index"
-DATA_FOLDER = r"C:\Users\zuham\Downloads\Scrapped Data\Scrapped Data"
+
 
 # ====== INIT CLIENTS ======
 genai.configure(api_key=GEMINI_API_KEY)
