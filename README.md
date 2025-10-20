@@ -134,5 +134,3 @@ Contributions are welcome! Feel free to open issues, suggest features, or submit
 Specify your license here (MIT, Apache 2.0, etc.)
 
 ---
-
-If you like, I can generate a **README with badges, sample screenshots, and templated `.env` file** ready to go. Do you want me to prepare that for you?
