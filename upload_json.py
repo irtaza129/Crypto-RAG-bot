@@ -1,129 +1,165 @@
-
 import os
 import json
-from pinecone import Pinecone
+from dotenv import load_dotenv
+from pinecone import Pinecone, ServerlessSpec
 import google.generativeai as genai
 from utils.logger import logger
 
+# =====================================================
+# Load environment variables
+# =====================================================
+load_dotenv()
 
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DATA_FOLDER = os.getenv("DATA_FOLDER", "Scrapped Data")
+UPLOADED_FILE_TRACKER = "uploaded_files.json"
 
-# ====== INIT CLIENTS ======
-genai.configure(api_key=GEMINI_API_KEY)
+if not all([PINECONE_API_KEY, PINECONE_INDEX_NAME, GEMINI_API_KEY]):
+    raise ValueError("Missing required environment variables")
+
+# =====================================================
+# Load uploaded files tracker
+# =====================================================
+if os.path.exists(UPLOADED_FILE_TRACKER):
+    with open(UPLOADED_FILE_TRACKER, "r", encoding="utf-8") as f:
+        data = json.load(f)
+        if isinstance(data, dict):
+            uploaded_files = set(data.keys())
+        elif isinstance(data, list):
+            uploaded_files = set(data)
+        else:
+            uploaded_files = set()
+else:
+    uploaded_files = set()
+
+logger.info(f"Skipping {len(uploaded_files)} already-uploaded files")
+
+# =====================================================
+# Pinecone init
+# =====================================================
 pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(INDEX_NAME)
 
-# ====== TEST CONNECTION ======
-logger.info(f"Available indexes: {pc.list_indexes()}")
+existing_indexes = [idx["name"] for idx in pc.list_indexes()]
+if PINECONE_INDEX_NAME not in existing_indexes:
+    logger.info(f"Creating Pinecone index: {PINECONE_INDEX_NAME}")
+    pc.create_index(
+        name=PINECONE_INDEX_NAME,
+        dimension=768,
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1")
+    )
 
-# ====== EMBEDDING FUNCTION ======
-def embed_text(text):
-    result = genai.embed_content(
+index = pc.Index(PINECONE_INDEX_NAME)
+
+# =====================================================
+# Gemini
+# =====================================================
+genai.configure(api_key=GEMINI_API_KEY)
+
+def embed_text(text: str):
+    return genai.embed_content(
         model="models/embedding-001",
         content=text
-    )
-    return result["embedding"]
+    )["embedding"]
 
-
-# ====== CHUNKING FUNCTION ======
+# =====================================================
+# Chunking
+# =====================================================
 def chunk_text(text, chunk_size=2000, overlap=500):
-    """Split long text into larger chunks with overlap for faster embedding."""
     chunks = []
     start = 0
     while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk)
+        chunks.append(text[start:start + chunk_size])
         start += chunk_size - overlap
     return chunks
 
-# ====== JURISDICTION EXTRACTION ======
-def extract_jurisdiction(file_name, text=None):
-    """
-    Extract jurisdiction/country from file name or text. Treat 'EU' as a country.
-    Extend this mapping as needed.
-    """
-    JURISDICTION_KEYWORDS = {
-        "FCA": "UK", "UK": "UK", "MAS": "Singapore", "Singapore": "Singapore",
-        "SEC": "USA", "USA": "USA", "US": "USA", "FinCEN": "USA", "FINTRAC": "Canada",
-        "Canada": "Canada", "FSA": "Japan", "Japan": "Japan", "AUSTRAC": "Australia",
-        "Australia": "Australia", "SFC": "Hong Kong", "Hong Kong": "Hong Kong",
-        "ADGM": "UAE", "UAE": "UAE", "EU": "EU", "European Union": "EU"
-    }
-    # Check file name
-    for keyword, country in JURISDICTION_KEYWORDS.items():
-        if keyword.lower() in file_name.lower():
-            return country
-    # Optionally check text
-    if text:
-        for keyword, country in JURISDICTION_KEYWORDS.items():
-            if keyword.lower() in text.lower():
-                return country
-    return "Unknown"
+# =====================================================
+# Batching
+# =====================================================
+BATCH_SIZE = 50
 
-# ====== BATCHING UTILS ======
-BATCH_SIZE = 50  # You can adjust this as needed
-def batch_iterable(iterable, batch_size):
-    for i in range(0, len(iterable), batch_size):
-        yield iterable[i:i + batch_size]
+def batch_iter(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
+# =====================================================
+# Ingestion
+# =====================================================
+logger.info(f"Starting ingestion from: {DATA_FOLDER}")
 
-# ====== SKIP ALREADY EMBEDDED FILES ======
-SKIP_FILES = {"AC_Regulations.json", "ADGM_Regulations.json", "APRA_Compliance.json"}
+uploaded_this_run = []
 
-# ====== LOOP THROUGH FILES ======
 for file_name in os.listdir(DATA_FOLDER):
-    if not file_name.endswith(".json") or file_name in SKIP_FILES:
+    if not file_name.endswith(".json"):
+        continue
+
+    if file_name in uploaded_files:
+        logger.info(f"[SKIP] Already uploaded: {file_name}")
         continue
 
     file_path = os.path.join(DATA_FOLDER, file_name)
-    logger.info(f"\U0001F4C4 Processing {file_name}")
+    logger.info(f"[PROCESS] {file_name}")
 
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        chunks = []
-        if isinstance(data, list):
-            for i, doc in enumerate(data):
-                text = doc.get("content") or doc.get("text") or str(doc)
-                if text.strip():
-                    jurisdiction = extract_jurisdiction(file_name, text)
-                    for j, sub_chunk in enumerate(chunk_text(text)):
-                        chunks.append((f"{file_name}_{i}_{j}", sub_chunk, jurisdiction))
-        elif isinstance(data, dict):
-            for key, value in data.items():
-                text = str(value)
-                if text.strip():
-                    jurisdiction = extract_jurisdiction(file_name, text)
-                    for j, sub_chunk in enumerate(chunk_text(text)):
-                        chunks.append((f"{file_name}_{key}_{j}", sub_chunk, jurisdiction))
-        else:
-            jurisdiction = extract_jurisdiction(file_name, str(data))
-            for j, sub_chunk in enumerate(chunk_text(str(data))):
-                chunks.append((f"{file_name}_{j}", sub_chunk, jurisdiction))
+        documents = data if isinstance(data, list) else [data]
+        vectors = []
 
-        total_uploaded = 0
-        for batch in batch_iterable(chunks, BATCH_SIZE):
-            vectors = []
-            for _id, text, jurisdiction in batch:
-                vector = embed_text(text)
+        for doc_idx, doc in enumerate(documents):
+            if not isinstance(doc, dict):
+                continue
+
+            content = (doc.get("content") or "").strip()
+            if not content:
+                continue
+
+            country_name = doc.get("country_name", "Global")
+            metadata_base = {
+                "title": doc.get("title"),
+                "category": doc.get("category"),
+                "date": doc.get("date"),
+                "source_name": doc.get("source_name"),
+                "source_link": doc.get("source_link"),
+                "country_name": country_name,
+                "jurisdiction": country_name
+            }
+
+            for chunk_idx, chunk in enumerate(chunk_text(content)):
                 vectors.append({
-                    "id": _id,
-                    "values": vector,
+                    "id": f"{file_name}_{doc_idx}_{chunk_idx}",
+                    "values": embed_text(chunk),
                     "metadata": {
-                        "source": file_name,
-                        "text": text[:300],
-                        "jurisdiction": jurisdiction
+                        **metadata_base,
+                        "chunk_text": chunk[:1200]
                     }
                 })
-            if vectors:
-                index.upsert(vectors=vectors)
-                total_uploaded += len(vectors)
-                logger.info(f"✅ Uploaded {len(vectors)} records from {file_name} (batch)")
-        logger.info(f"✅ Uploaded {total_uploaded} records from {file_name} (total)")
+
+        uploaded_count = 0
+        for batch in batch_iter(vectors, BATCH_SIZE):
+            index.upsert(vectors=batch)
+            uploaded_count += len(batch)
+
+        logger.info(f"[OK] Uploaded {uploaded_count} vectors from {file_name}")
+
+        # Mark file as uploaded ONLY after success
+        uploaded_files.add(file_name)
+        uploaded_this_run.append(file_name)
+        with open(UPLOADED_FILE_TRACKER, "w", encoding="utf-8") as f:
+            json.dump(list(uploaded_files), f, indent=2)
 
     except Exception as e:
-        logger.error(f"❌ Error processing {file_name}: {e}")
+        logger.error(f"[ERROR] Failed {file_name}: {e}")
 
-logger.info("🎉 All files processed and uploaded!")
-logger.info(f"📊 Pinecone index stats: {index.describe_index_stats()}")
+# =====================================================
+# Summary of uploaded files
+# =====================================================
+if uploaded_this_run:
+    logger.info("Upload complete. Files uploaded in this run:")
+    for fn in uploaded_this_run:
+        logger.info(f"  - {fn}")
+else:
+    logger.info("No new files uploaded in this run.")

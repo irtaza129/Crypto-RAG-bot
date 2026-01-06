@@ -93,6 +93,31 @@ You can send HTTP requests to the bot (via Postman, curl, or frontend) to query 
 * retrieve top documents via vector search
 * feed retrieved documents + user prompt into the Gemini LLM to generate an answer
 
+### Streaming responses
+
+This project exposes an SSE streaming endpoint so clients can receive answers progressively.
+
+- Endpoint: `POST /query/stream`
+- Content-Type: `application/json`
+- Body: `{ "query": "Your question here" }`
+
+Example using `curl` (keeps connection open and prints events as they arrive):
+
+```bash
+curl -N -X POST "http://localhost:8000/query/stream" \
+	-H "Content-Type: application/json" \
+	-d '{"query":"What are the FCA rules for crypto exchanges?"}'
+```
+
+Notes:
+- The stream is Server-Sent Events (SSE) with `data:` messages containing
+	chunks of the textual answer.
+- After the text stream finishes the server sends an `event: metadata` message
+	whose `data:` payload contains the `retrieved_chunks` JSON array.
+- To implement true LLM-level streaming (avoid waiting for the full answer
+	before emitting), integrate your LLM client in streaming/callback mode
+	(Gemini/Google GenAI streaming) and yield parts as they're produced.
+
 ---
 
 ## 🧪 Testing
